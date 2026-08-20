@@ -226,6 +226,167 @@ describe("Multimodal content", () => {
     expect(midTurns.some((m: any) => m.message.content.some((b: any) => b.type === "image"))).toBe(false)
   })
 
+  it("should unwrap a text-only tool_result to a text block when the request is multimodal", async () => {
+    // Regression: AskUserInpaintArea's result ({snapshot_url, crop}) rode in a
+    // text-only tool_result. Its matching assistant tool_use is dropped by
+    // flattenAssistantContent, so keeping the tool_result structured orphaned it
+    // and the SDK/API discarded it — the model never saw snapshot_url / crop.
+    // The cropped-image upload makes the request multimodal (structured path).
+    const app = createTestApp()
+    await (await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 1024,
+      stream: false,
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "hist_0_0", name: "AskUserInpaintArea", input: { source_image_url: "https://x/a.png" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "hist_0_0",
+              content: [
+                { type: "text", text: '{"snapshot_url":"https://x/snap.png","width":800,"height":600,"crop":{"x":10,"y":20,"w":100,"h":50}}' },
+              ],
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "[image url=https://x/i/42 dimensions=100x50]" },
+            { type: "image", source: { type: "base64", media_type: "image/png", data: "abc" } },
+          ],
+        },
+      ],
+    })).json()
+
+    expect(typeof capturedQueryParams.prompt).not.toBe("string")
+
+    const messages: any[] = []
+    for await (const msg of capturedQueryParams.prompt) {
+      messages.push(msg)
+    }
+
+    // The tool_result content must survive as a plain text block...
+    const allTextBlocks = messages.flatMap((m: any) =>
+      Array.isArray(m.message?.content)
+        ? m.message.content.filter((b: any) => b.type === "text").map((b: any) => b.text)
+        : typeof m.message?.content === "string" ? [m.message.content] : []
+    )
+    expect(allTextBlocks.some((t: string) => t.includes("snapshot_url") && t.includes('"crop"'))).toBe(true)
+
+    // ...and no orphaned tool_result block may reach the SDK.
+    const hasOrphanedToolResult = messages.some((m: any) =>
+      Array.isArray(m.message?.content) &&
+      m.message.content.some((b: any) => b.type === "tool_result")
+    )
+    expect(hasOrphanedToolResult).toBe(false)
+  })
+
+  it("should unwrap a STRING-content tool_result when the request is multimodal", async () => {
+    // The Vercel AI SDK's Anthropic provider sends a bare string for `text` and
+    // `error-text` tool outputs, so a client whose tools return plain strings
+    // sends every result through this branch. It used to miss the array-only
+    // guard entirely and reach the SDK as an orphaned tool_result.
+    const app = createTestApp()
+    await (await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 1024,
+      stream: false,
+      messages: [
+        { role: "user", content: [
+          { type: "text", text: "run it" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "abc" } },
+        ] },
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_9", name: "WorkspaceExecJS", input: { path: "main.js" } }] },
+        { role: "user", content: [
+          { type: "tool_result", tool_use_id: "toolu_9", content: "TypeError: x is not a function", is_error: true },
+        ] },
+      ],
+    })).json()
+
+    const messages: any[] = []
+    for await (const msg of capturedQueryParams.prompt) messages.push(msg)
+
+    const allTextBlocks = messages.flatMap((m: any) =>
+      Array.isArray(m.message?.content)
+        ? m.message.content.filter((b: any) => b.type === "text").map((b: any) => b.text)
+        : typeof m.message?.content === "string" ? [m.message.content] : []
+    )
+    expect(allTextBlocks.some((t: string) => t.includes("TypeError: x is not a function"))).toBe(true)
+    expect(messages.some((m: any) =>
+      Array.isArray(m.message?.content) && m.message.content.some((b: any) => b.type === "tool_result")
+    )).toBe(false)
+  })
+
+  it("attributes an unwrapped tool_result to the call that produced it (#552)", async () => {
+    // The replay drops the assistant tool_use, so an unlabelled result lands in
+    // a USER turn with no cause and the model disowns it. The text path has
+    // emitted `[your <tool> <target>]` since #552; the structured path must too.
+    const app = createTestApp()
+    await (await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 1024,
+      stream: false,
+      messages: [
+        { role: "user", content: [
+          { type: "text", text: "read it" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "abc" } },
+        ] },
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_5", name: "read", input: { path: "/tmp/a.txt" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_5", content: "file body" }] },
+      ],
+    })).json()
+
+    const messages: any[] = []
+    for await (const msg of capturedQueryParams.prompt) messages.push(msg)
+
+    const allTextBlocks = messages.flatMap((m: any) =>
+      Array.isArray(m.message?.content)
+        ? m.message.content.filter((b: any) => b.type === "text").map((b: any) => b.text)
+        : typeof m.message?.content === "string" ? [m.message.content] : []
+    )
+    expect(allTextBlocks.some((t: string) =>
+      t.includes("[your read /tmp/a.txt]") && t.includes("file body")
+    )).toBe(true)
+  })
+
+  it("keeps a client-driven tool round from adding nothing to the prompt", async () => {
+    // The loop bug in one assertion. A client that drives its own tool loop
+    // sends assistant[tool_use] + user[tool_result] each step. The assistant
+    // turn flattens to "" and the result used to be discarded as an orphan, so
+    // the prompt never changed and the model re-issued the same call forever.
+    const base = [
+      { role: "user", content: [
+        { type: "text", text: "start" },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "abc" } },
+      ] },
+    ]
+    const step = [
+      { role: "assistant", content: [{ type: "tool_use", id: "toolu_a", name: "bash", input: { command: "ls" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_a", content: "boom", is_error: true }] },
+    ]
+
+    async function promptFor(messages: any[]) {
+      const app = createTestApp()
+      await (await post(app, { model: "claude-sonnet-4-5", max_tokens: 1024, stream: false, messages })).json()
+      const out: any[] = []
+      for await (const msg of capturedQueryParams.prompt) out.push(msg)
+      return JSON.stringify(out)
+    }
+
+    const before = await promptFor(base)
+    const after = await promptFor([...base, ...step])
+    expect(after).not.toBe(before)
+    expect(after).toContain("boom")
+  })
+
   it("should include all message roles in structured messages", async () => {
     const app = createTestApp()
     await (await post(app, {
