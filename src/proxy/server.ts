@@ -249,8 +249,52 @@ function stripCacheControlDeep(content: any): any {
   })
 }
 
+/**
+ * Extract plain text from a tool_result's `content` (string or block array).
+ * Used to unwrap text-only tool_results in the structured (multimodal) path so
+ * their content survives as a normal text block instead of an orphaned
+ * tool_result. Mirrors the tool_result handling in flattenUserContent.
+ *
+ * A string `content` is the common case, not an edge case: the Vercel AI SDK's
+ * Anthropic provider emits a bare string for both `text` and `error-text` tool
+ * outputs, so a client that returns plain strings from its tools sends every
+ * result — including every error — through this branch.
+ */
+function extractToolResultText(content: any): string {
+  if (typeof content === "string") return content
+  if (Array.isArray(content)) {
+    return content
+      .map((b: any) => (b?.type === "text" && b.text ? b.text : ""))
+      .filter(Boolean)
+      .join("\n")
+  }
+  return ""
+}
+
+/**
+ * Render the `[your <tool> <target>]` attribution for a replayed tool_result,
+ * or undefined when the originating tool_use isn't in the index.
+ *
+ * The replay drops the assistant tool_use that produced the result, so the
+ * output lands inside a USER turn with no visible cause. Without the label the
+ * model reads its own work as someone else's and denies making the call (#552).
+ * The text path has emitted this since #552; the structured path must match, or
+ * a conversation turns multimodal and silently loses the attribution.
+ */
+function describeToolResultBlock(
+  block: any,
+  toolIndex?: Map<string, import("./messages").ToolCallInfo>
+): string | undefined {
+  const info = toolIndex?.get(block?.tool_use_id)
+  return info ? describeToolCall(info) : undefined
+}
+
 function normalizeStructuredUserContent(
   content: any,
+  toolIndex?: Map<string, import("./messages").ToolCallInfo>,
+  // True during a passthrough continuation: the SDK session was rewound to the
+  // assistant tool_use checkpoint, so tool_results are NOT orphaned and must
+  // keep their wrappers for the SDK to pair them with the pending calls.
   preserveToolResultWrapper = false
 ): any {
   if (!Array.isArray(content)) return content
@@ -263,14 +307,40 @@ function normalizeStructuredUserContent(
       Array.isArray(block.content) &&
       hasMultimodalContent(block.content)
     ) {
-      normalized.push(...normalizeStructuredUserContent(block.content))
+      // Media must stay as real blocks for the model to see it, so this result
+      // is spliced in rather than flattened. Lead with the attribution label
+      // for the same reason the text-only branch below appends it.
+      const label = describeToolResultBlock(block, toolIndex)
+      if (label) normalized.push({ type: "text", text: label })
+      normalized.push(...normalizeStructuredUserContent(block.content, toolIndex))
       continue
     }
-    if (block.type === "tool_result" && Array.isArray(block.content)) {
+    if (preserveToolResultWrapper && block.type === "tool_result" && Array.isArray(block.content)) {
       normalized.push({
         ...block,
-        content: normalizeStructuredUserContent(block.content, preserveToolResultWrapper),
+        content: normalizeStructuredUserContent(block.content, toolIndex, preserveToolResultWrapper),
       })
+      continue
+    }
+    if (!preserveToolResultWrapper && block.type === "tool_result") {
+      // Unwrap a text-only tool_result into a plain text block. Its matching
+      // tool_use was dropped by flattenAssistantContent (issue #111/#386), so
+      // keeping the tool_result structured orphans it — the SDK/API discards an
+      // orphaned tool_result and its content never reaches the model (e.g.
+      // AskUserInpaintArea's snapshot_url + crop coords vanished on the cropped-
+      // image continuation, which is multimodal so it hits this path). Mirrors
+      // the text-path unwrap in flattenUserContent.
+      //
+      // Dropping them also freezes a client-driven tool loop. Such a request is
+      // classified independent, so it full-replays: the assistant turn flattens
+      // to "" (tool_use only) and the user turn is discarded as an orphan, so an
+      // appended tool round adds NOTHING to the prompt. The model then re-reads
+      // a byte-identical prompt and re-issues the same call forever — visible as
+      // a flat `input=2 cache=100%` while msgCount climbs.
+      const label = describeToolResultBlock(block, toolIndex)
+      const text = extractToolResultText(block.content)
+      const rendered = label ? (text ? `${label}:\n${text}` : label) : text
+      if (rendered) normalized.push({ type: "text", text: rendered })
       continue
     }
     normalized.push(block)
@@ -364,7 +434,7 @@ function buildFreshPrompt(
       if (m.role === "user") {
         structured.push({
           type: "user" as const,
-          message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content)) },
+          message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content), toolIndex) },
           parent_tool_use_id: null,
         })
       } else {
@@ -1585,6 +1655,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       let structuredMessages: Array<{ type: "user"; message: { role: string; content: any }; parent_tool_use_id: null }> | undefined
       let textPrompt: string | undefined
 
+      // Tool-result attribution is indexed from the FULL history so ids resolve
+      // even when the originating call sits before a resume-delta boundary
+      // (#552). Both prompt paths need it: the text path labels its flattened
+      // results, the structured path labels its unwrapped ones.
+      const toolIndex = buildToolUseIndex(allMessages ?? messagesToConvert ?? [])
+
       if (hasMultimodal || hasPassthroughToolResults) {
         // Structured messages preserve image/document/file and tool_result blocks.
         // On resume, only send user messages (SDK has assistant context already).
@@ -1599,6 +1675,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 type: "user" as const,
                 message: { role: "user" as const, content: normalizeStructuredUserContent(
                   stripCacheControlDeep(m.content),
+                  toolIndex,
                   Boolean(passthroughToolCallAssistantUuid)
                 ) },
                 parent_tool_use_id: null,
@@ -1613,6 +1690,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 type: "user" as const,
                 message: { role: "user" as const, content: normalizeStructuredUserContent(
                   stripCacheControlDeep(m.content),
+                  toolIndex,
                   Boolean(passthroughToolCallAssistantUuid)
                 ) },
                 parent_tool_use_id: null,
@@ -1647,10 +1725,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // `<system-reminder>` is only stripped for adapters that leak CWD
         // through it (Droid) — preserved otherwise so that harness state
         // like oh-my-opencode's background-task IDs reaches the model.
-        // Tool-result attribution is indexed from the FULL history so ids
-        // resolve even when the originating call sits before a resume-delta
-        // boundary (#552).
-        const toolIndex = buildToolUseIndex(allMessages ?? messagesToConvert ?? [])
         // NEVER render 'Human:'/'Assistant:' transcript lines — the model
         // imitates that format, emitting 'Human: ...' turns itself and
         // self-approving actions (#496 self-talk). Match the structured
